@@ -81,17 +81,38 @@ type segment struct {
 // The "{$}" and "{name...}" wildcard must occur at the end of PATH.
 // PATH may end with a '/'.
 // Wildcard names in a path must be distinct.
+//
+// parsePattern 将路由字符串解析为结构化的 *pattern 对象。
+// 字符串语法为：
+//
+//	[METHOD] [HOST]/[PATH]
+//
+// 各部分含义：
+//   - METHOD：HTTP 方法（GET、POST 等），可选
+//   - HOST：主机名，可选
+//   - PATH：由 '/' 分隔的路径段组成，每段可以是字面量或以下三种通配符：
+//     {name}    匹配单个路径段，捕获值可通过 r.PathValue("name") 获取
+//     {name...} 贪婪匹配剩余所有路径段（必须位于 PATH 末尾）
+//     {$}       精确匹配到结尾，等价于要求路径不含更多段（必须位于 PATH 末尾）
+//
+// METHOD、HOST、PATH 均可省略，最简合法 pattern 为 "/"。
+// METHOD 若存在，其后必须跟至少一个空格或制表符。
+// 通配符名称须是合法的 Go 标识符，且同一 PATH 内不能重复。
 func parsePattern(s string) (_ *pattern, err error) {
 	if len(s) == 0 {
 		return nil, errors.New("empty pattern")
 	}
-	off := 0 // offset into string
+	off := 0 // offset into string（当前解析偏移量，用于错误信息定位）
+	// 统一在 err 上附加偏移量，方便调用者定位解析失败的位置
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("at offset %d: %w", off, err)
 		}
 	}()
 
+	// ── 第一步：分离 METHOD 和 HOST/PATH ──────────────────────────
+	// 以第一个空格或制表符为分界点切割，左侧为 METHOD，右侧为 HOST/PATH。
+	// 若没有空格，则整体作为 HOST/PATH，METHOD 为空。
 	method, rest, found := s, "", false
 	if i := strings.IndexAny(s, " \t"); i >= 0 {
 		method, rest, found = s[:i], strings.TrimLeft(s[i+1:], " \t"), true
@@ -100,20 +121,23 @@ func parsePattern(s string) (_ *pattern, err error) {
 		rest = method
 		method = ""
 	}
-	if method != "" && !validMethod(method) {
+	if method != "" && !validMethod(method) { //  校验方法名是否符合 RFC 2616 的 token 规则
 		return nil, fmt.Errorf("invalid method %q", method)
 	}
 	p := &pattern{str: s, method: method}
 
+	// ── 第二步：分离 HOST 和 PATH ─────────────────────────────────
 	if found {
 		off = len(method) + 1
 	}
+	// PATH 以第一个 '/' 为起点，'/' 之前的部分为 HOST
 	i := strings.IndexByte(rest, '/')
 	if i < 0 {
 		return nil, errors.New("host/path missing /")
 	}
 	p.host = rest[:i]
 	rest = rest[i:]
+	// HOST 中不允许出现 '{'，否则可能是漏写了开头的 '/'
 	if j := strings.IndexByte(p.host, '{'); j >= 0 {
 		off += j
 		return nil, errors.New("host contains '{' (missing initial '/'?)")
@@ -121,22 +145,29 @@ func parsePattern(s string) (_ *pattern, err error) {
 	// At this point, rest is the path.
 	off += i
 
+	// 非 CONNECT 请求的路径会在匹配前经过 cleanPath 规范化，
+	// 若注册时路径本身不干净，则永远无法被匹配到，直接报错。
 	// An unclean path with a method that is not CONNECT can never match,
 	// because paths are cleaned before matching.
 	if method != "" && method != "CONNECT" && rest != cleanPath(rest) {
 		return nil, errors.New("non-CONNECT pattern with unclean path can never match")
 	}
 
-	seenNames := map[string]bool{} // remember wildcard names to catch dups
+	// ── 第三步：逐段解析 PATH ─────────────────────────────────────
+	seenNames := map[string]bool{} // remember wildcard names to catch dups（记录已出现的通配符名，用于检测重复）
 	for len(rest) > 0 {
 		// Invariant: rest[0] == '/'.
+		// 每次循环开头跳过 '/'，逐段处理
 		rest = rest[1:]
 		off = len(s) - len(rest)
 		if len(rest) == 0 {
 			// Trailing slash.
+			// 路径以 '/' 结尾（如 "/static/"），等价于一个贪婪多段通配符，
+			// 匹配该路径及其所有子路径。
 			p.segments = append(p.segments, segment{wild: true, multi: true})
 			break
 		}
+		// 取出下一个 '/' 之前的路径段
 		i := strings.IndexByte(rest, '/')
 		if i < 0 {
 			i = len(rest)
@@ -145,10 +176,12 @@ func parsePattern(s string) (_ *pattern, err error) {
 		seg, rest = rest[:i], rest[i:]
 		if i := strings.IndexByte(seg, '{'); i < 0 {
 			// Literal.
+			// 字面量段：URL 解码后直接存入，匹配时做精确字符串比较
 			seg = pathUnescape(seg)
 			p.segments = append(p.segments, segment{s: seg})
 		} else {
 			// Wildcard.
+			// 通配符段：必须以 '{' 开头、'}' 结尾，中间为通配符名
 			if i != 0 {
 				return nil, errors.New("bad wildcard segment (must start with '{')")
 			}
@@ -157,22 +190,27 @@ func parsePattern(s string) (_ *pattern, err error) {
 			}
 			name := seg[1 : len(seg)-1]
 			if name == "$" {
+				// {$}：精确匹配到路径末尾，后面不能再有路径段
 				if len(rest) != 0 {
 					return nil, errors.New("{$} not at end")
 				}
 				p.segments = append(p.segments, segment{s: "/"})
 				break
 			}
+			// 检查是否为 {name...} 贪婪通配符
 			name, multi := strings.CutSuffix(name, "...")
 			if multi && len(rest) != 0 {
+				// {name...} 必须位于 PATH 最后一段
 				return nil, errors.New("{...} wildcard not at end")
 			}
 			if name == "" {
 				return nil, errors.New("empty wildcard")
 			}
+			// 通配符名须是合法 Go 标识符（字母/下划线开头，后接字母/数字/下划线）
 			if !isValidWildcardName(name) {
 				return nil, fmt.Errorf("bad wildcard name %q", name)
 			}
+			// 同一 pattern 内通配符名不能重复
 			if seenNames[name] {
 				return nil, fmt.Errorf("duplicate wildcard name %q", name)
 			}

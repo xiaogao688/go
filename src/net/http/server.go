@@ -1009,11 +1009,17 @@ const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
+// readRequest 从连接中读取并解析一个 HTTP 请求，返回封装好的 *response 对象。
+// *response 同时持有请求（req）和响应写入器，是 HTTP/1.x 请求处理的核心载体。
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+	// 若连接已被 hijack（外部接管），不再读取新请求
 	if c.hijacked() {
 		return nil, ErrHijacked
 	}
 
+	// ── 超时计算 ──────────────────────────────────────────────────
+	// wholeReqDeadline：整个请求（含 body）的读取截止时间，对应 Server.ReadTimeout
+	// hdrDeadline：仅请求头的读取截止时间，对应 Server.ReadHeaderTimeout
 	var (
 		wholeReqDeadline time.Time // or zero if none
 		hdrDeadline      time.Time // or zero if none
@@ -1025,42 +1031,55 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if d := c.server.ReadTimeout; d > 0 {
 		wholeReqDeadline = t0.Add(d)
 	}
+	// 先按请求头超时设置读截止时间；读完头部后再切换为整体超时（见下方 Adjust）
 	c.rwc.SetReadDeadline(hdrDeadline)
+	// 写超时在请求头读取完毕后通过 defer 设置，确保 Handler 执行期间也受写超时保护
 	if d := c.server.WriteTimeout; d > 0 {
 		defer func() {
 			c.rwc.SetWriteDeadline(time.Now().Add(d))
 		}()
 	}
 
+	// ── 读取请求头 ────────────────────────────────────────────────
+	// 设置读取上限（默认 1MB + 4096），超出则触发 errTooLarge（431 响应）
 	c.r.setReadLimit(c.server.initialReadLimitSize())
 	if c.lastMethod == "POST" {
 		// RFC 7230 section 3 tolerance for old buggy clients.
+		// 部分老旧客户端在 POST 后会多发 CRLF，这里容忍性地跳过前导 \r\n
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
 	}
 	req, err := readRequest(c.bufr)
 	if err != nil {
 		if c.r.hitReadLimit() {
+			// 触达读取上限，转换为标准的 errTooLarge，上层会返回 431
 			return nil, errTooLarge
 		}
 		return nil, err
 	}
 
+	// 校验 HTTP 版本：仅支持 HTTP/1.x，HTTP/0.9 等不受支持的版本返回 505
 	if !http1ServerSupportsRequest(req) {
 		return nil, statusError{StatusHTTPVersionNotSupported, "unsupported protocol version"}
 	}
 
+	// 记录本次请求方法，供下一次请求的 POST 容忍逻辑使用
 	c.lastMethod = req.Method
+	// 请求头已读完，解除读取上限（body 大小由 Handler 自行控制）
 	c.r.setInfiniteReadLimit()
 
+	// ── 请求头合法性校验 ──────────────────────────────────────────
 	hosts, haveHost := req.Header["Host"]
 	isH2Upgrade := req.isH2Upgrade()
+	// HTTP/1.1 规范要求必须携带 Host 头（CONNECT 方法和 h2c 升级请求除外）
 	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
 		return nil, badRequestError("missing required Host header")
 	}
+	// Host 头格式校验，防止 Host 注入攻击
 	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
 		return nil, badRequestError("malformed Host header")
 	}
+	// 遍历所有请求头，校验字段名和字段值的合法性，防止头注入
 	for k, vv := range req.Header {
 		if !httpguts.ValidHeaderFieldName(k) {
 			return nil, badRequestError("invalid header name")
@@ -1071,39 +1090,48 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 			}
 		}
 	}
+	// Host 已记录到 req.Host 字段，从 Header map 中删除，避免重复
 	delete(req.Header, "Host")
 
+	// ── 填充请求元数据 ────────────────────────────────────────────
+	// 为请求绑定可取消的 context，连接关闭或超时时自动取消
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
 	req.TLS = c.tlsState
 	if body, ok := req.Body.(*body); ok {
+		// doEarlyClose=true：允许在 Handler 未读完 body 时提前关闭连接
 		body.doEarlyClose = true
 	}
 
 	// Adjust the read deadline if necessary.
+	// 请求头读取完毕，若整体超时与头部超时不同，切换到整体超时（覆盖 body 读取阶段）
 	if !hdrDeadline.Equal(wholeReqDeadline) {
 		c.rwc.SetReadDeadline(wholeReqDeadline)
 	}
 
+	// ── 构造 response 对象 ────────────────────────────────────────
 	w = &response{
 		conn:          c,
 		cancelCtx:     cancelCtx,
 		req:           req,
 		reqBody:       req.Body,
 		handlerHeader: make(Header),
-		contentLength: -1,
+		contentLength: -1, // 未知内容长度，后续由 Handler 设置或自动计算
 
 		// We populate these ahead of time so we're not
 		// reading from req.Header after their Handler starts
 		// and maybe mutates it (Issue 14940)
+		// 提前读取 keep-alive 和 close 意图，防止 Handler 修改 Header 后读到脏数据
 		wants10KeepAlive: req.wantsHttp10KeepAlive(),
 		wantsClose:       req.wantsClose(),
 	}
 	if isH2Upgrade {
+		// h2c 升级请求完成后不复用连接，响应后立即关闭
 		w.closeAfterReply = true
 	}
 	w.cw.res = w
+	// 为响应写入器套上 bufio 缓冲，减少小块写入的系统调用次数
 	w.w = newBufioWriterSize(&w.cw, bufferBeforeChunkingSize)
 	return w, nil
 }
@@ -1930,36 +1958,56 @@ type connectionStater interface {
 }
 
 // Serve a new connection.
+// 处理一个新的 HTTP 连接，整个连接生命周期都在此函数内完成。
+/*
+请求如何进入 Handler 和中间件
+  conn.serve()                          ← 每个 TCP 连接一个 goroutine
+    └─ serverHandler{srv}.ServeHTTP()   ← server.go:3408
+         └─ srv.Handler.ServeHTTP()     ← 用户注册的根 Handler（或 DefaultServeMux）
+              └─ ServeMux.ServeHTTP()   ← server.go:2924（如果用的是 ServeMux）
+                   └─ findHandler()     ← 路由匹配，server.go:2772
+                        └─ h.ServeHTTP(w, r)  ← 最终的用户处理函数
+*/
 func (c *conn) serve(ctx context.Context) {
+	// 记录客户端远程地址，用于日志输出
 	if ra := c.rwc.RemoteAddr(); ra != nil {
 		c.remoteAddr = ra.String()
 	}
+	// 将本地监听地址注入到 context 中，供 Handler 通过 LocalAddrContextKey 获取
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	var inFlightResponse *response
+	// defer 保证连接退出时的清理工作：panic 恢复、取消正在进行的响应、关闭连接
 	defer func() {
+		// 捕获 handler 中的 panic（ErrAbortHandler 是主动中止，不记录日志）
 		if err := recover(); err != nil && err != ErrAbortHandler {
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
 		}
+		// 如果连接退出时仍有正在处理的响应，取消其 context 并禁止继续写 100-continue
 		if inFlightResponse != nil {
 			inFlightResponse.cancelCtx()
 			inFlightResponse.disableWriteContinue()
 		}
+		// 若连接未被 hijack（未被外部接管），则执行标准的关闭流程
 		if !c.hijacked() {
 			if inFlightResponse != nil {
+				// 中止未完成的请求体读取，并关闭请求 body
 				inFlightResponse.conn.r.abortPendingRead()
 				inFlightResponse.reqBody.Close()
 			}
 			c.close()
+			// 将连接状态更新为 StateClosed，并触发 ConnState 钩子
 			c.setState(c.rwc, StateClosed, runHooks)
 		}
 	}()
 
+	// ── TLS 握手阶段 ──────────────────────────────────────────────
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
 		tlsTO := c.server.tlsHandshakeTimeout()
 		if tlsTO > 0 {
+			// 为 TLS 握手设置读写超时，防止握手卡死
 			dl := time.Now().Add(tlsTO)
 			c.rwc.SetReadDeadline(dl)
 			c.rwc.SetWriteDeadline(dl)
@@ -1968,6 +2016,7 @@ func (c *conn) serve(ctx context.Context) {
 			// If the handshake failed due to the client not speaking
 			// TLS, assume they're speaking plaintext HTTP and write a
 			// 400 response on the TLS conn's underlying net.Conn.
+			// 握手失败：若客户端发送的是明文 HTTP，返回 400 提示其使用 HTTPS
 			var reason string
 			if re, ok := err.(tls.RecordHeaderError); ok && re.Conn != nil && tlsRecordHeaderLooksLikeHTTP(re.RecordHeader) {
 				io.WriteString(re.Conn, "HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n")
@@ -1980,18 +2029,22 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		// Restore Conn-level deadlines.
+		// 握手完成后清除超时，恢复为无限期（后续由 ReadTimeout 等字段控制）
 		if tlsTO > 0 {
 			c.rwc.SetReadDeadline(time.Time{})
 			c.rwc.SetWriteDeadline(time.Time{})
 		}
+		// 保存 TLS 连接状态，供 Request.TLS 字段使用
 		c.tlsState = new(tls.ConnectionState)
 		*c.tlsState = tlsConn.ConnectionState()
+		// 检查 ALPN 协商结果：若协商出 HTTP/2 等下一代协议，交由对应的 NextProto handler 处理
 		if proto := c.tlsState.NegotiatedProtocol; validNextProto(proto) {
 			if fn := c.server.TLSNextProto[proto]; fn != nil {
 				h := initALPNRequest{ctx, tlsConn, serverHandler{c.server}}
 				// Mark freshly created HTTP/2 as active and prevent any server state hooks
 				// from being run on these connections. This prevents closeIdleConns from
 				// closing such connections. See issue https://golang.org/issue/39776.
+				// 将连接标记为 Active，并跳过 ConnState 钩子（避免 HTTP/2 连接被误关闭）
 				c.setState(c.rwc, StateActive, skipHooks)
 				fn(c.server, tlsConn, h)
 			}
@@ -2000,8 +2053,10 @@ func (c *conn) serve(ctx context.Context) {
 	}
 
 	// HTTP/1.x from here on.
+	// ── 以下为 HTTP/1.x 处理逻辑 ──────────────────────────────────
 
 	// Set Request.TLS if the conn is not a *tls.Conn, but implements ConnectionState.
+	// 兼容非标准 TLS 实现：若底层连接实现了 ConnectionState 接口，也填充 tlsState
 	if c.tlsState == nil {
 		if tc, ok := c.rwc.(connectionStater); ok {
 			c.tlsState = new(tls.ConnectionState)
@@ -2009,30 +2064,37 @@ func (c *conn) serve(ctx context.Context) {
 		}
 	}
 
+	// 为 HTTP/1.x 创建可取消的 context，连接关闭时取消所有派生 context
 	ctx, cancelCtx := context.WithCancel(ctx)
 	c.cancelCtx = cancelCtx
 	defer cancelCtx()
 
+	// 初始化连接的读写缓冲，bufw 使用 4KB 写缓冲以减少系统调用次数
 	c.r = &connReader{conn: c, rwc: c.rwc}
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
+	// 检查是否需要尝试明文 HTTP/2（h2c）升级
 	protos := c.server.protocols()
 	if c.tlsState == nil && protos.UnencryptedHTTP2() {
 		if c.maybeServeUnencryptedHTTP2(ctx) {
 			return
 		}
 	}
+	// 若服务器不支持 HTTP/1，直接返回（连接由 defer 负责关闭）
 	if !protos.HTTP1() {
 		return
 	}
 
+	// ── HTTP/1.x 请求处理循环（keep-alive 复用同一连接）────────────
 	for {
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
+			// 只要从网络读到了数据，就将连接状态更新为 Active
 			c.setState(c.rwc, StateActive, runHooks)
 		}
+		// 服务器正在关闭时立即退出，不再接受新请求
 		if c.server.shuttingDown() {
 			return
 		}
@@ -2046,6 +2108,7 @@ func (c *conn) serve(ctx context.Context) {
 				// responding to them and hanging up
 				// while they're still writing their
 				// request. Undefined behavior.
+				// 请求头过大（> 1MB），返回 431 并关闭连接
 				const publicErr = "431 Request Header Fields Too Large"
 				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
 				c.closeWriteAndWait()
@@ -2056,21 +2119,25 @@ func (c *conn) serve(ctx context.Context) {
 				//      A server that receives a request message with a
 				//      transfer coding it does not understand SHOULD
 				//      respond with 501 (Unimplemented).
+				// 遇到不支持的 Transfer-Encoding，返回 501
 				code := StatusNotImplemented
 
 				// We purposefully aren't echoing back the transfer-encoding's value,
 				// so as to mitigate the risk of cross side scripting by an attacker.
+				// 故意不回显 Transfer-Encoding 的值，防止 XSS 攻击
 				fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s%sUnsupported transfer encoding", code, StatusText(code), errorHeaders)
 				return
 
 			case isCommonNetReadError(err):
-				return // don't reply
+				return // don't reply（常见网络读取错误，静默关闭连接）
 
 			default:
+				// 携带状态码的结构化错误，按其 code 返回响应
 				if v, ok := err.(statusError); ok {
 					fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s: %s%s%d %s: %s", v.code, StatusText(v.code), v.text, errorHeaders, v.code, StatusText(v.code), v.text)
 					return
 				}
+				// 其他未知错误，统一返回 400 Bad Request
 				const publicErr = "400 Bad Request"
 				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
 				return
@@ -2078,20 +2145,26 @@ func (c *conn) serve(ctx context.Context) {
 		}
 
 		// Expect 100 Continue support
+		// 处理 "Expect: 100-continue"：客户端在发送大请求体前等待服务器确认
 		req := w.req
 		if req.expectsContinue() {
 			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
 				// Wrap the Body reader with one that replies on the connection
+				// 用 expectContinueReader 包装 Body，读取时自动发送 100 Continue
 				req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
 				w.canWriteContinue.Store(true)
 			}
 		} else if req.Header.get("Expect") != "" {
+			// 收到了不认识的 Expect 值，返回 417 Expectation Failed
 			w.sendExpectationFailed()
 			return
 		}
 
+		// 将当前请求存储到连接上，用于超时检测等场景
 		c.curReq.Store(w)
 
+		// 若请求体尚未读完，等到读到 EOF 后再启动后台读（监听下一个请求的到来）；
+		// 否则立即启动后台读，保持连接活跃状态
 		if requestBodyRemains(req.Body) {
 			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
 		} else {
@@ -2105,22 +2178,30 @@ func (c *conn) serve(ctx context.Context) {
 		// in parallel even if their responses need to be serialized.
 		// But we're not going to implement HTTP pipelining because it
 		// was never deployed in the wild and the answer is HTTP/2.
+		// HTTP/1.1 不支持同时处理多个请求，直接在当前 goroutine 中运行 Handler
+		// （不实现 HTTP 流水线，因为其在实践中从未被广泛部署，HTTP/2 是正确答案）
 		inFlightResponse = w
-		serverHandler{c.server}.ServeHTTP(w, w.req)
+		serverHandler{c.server}.ServeHTTP(w, w.req) // 开始处理http请求
 		inFlightResponse = nil
 		w.cancelCtx()
+		// 若 Handler 内部 hijack 了连接，释放连接并退出（连接生命周期交由调用者管理）
 		if c.hijacked() {
 			c.r.releaseConn()
 			return
 		}
+		// 完成响应：刷新缓冲区、写入 trailer 等收尾工作
 		w.finishRequest()
+		// 清除写超时，避免影响下一次请求
 		c.rwc.SetWriteDeadline(time.Time{})
+		// 判断连接是否可以复用（keep-alive）
 		if !w.shouldReuseConnection() {
+			// 若请求体未读完就关闭，需等待写缓冲刷完再关闭（half-close）
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
 				c.closeWriteAndWait()
 			}
 			return
 		}
+		// 连接复用：重置为空闲状态
 		c.setState(c.rwc, StateIdle, runHooks)
 		c.curReq.Store(nil)
 
@@ -2129,9 +2210,11 @@ func (c *conn) serve(ctx context.Context) {
 			// to the user without "Connection: close" and
 			// they might think they can send another
 			// request, but such is life with HTTP/1.1.
+			// 服务器处于关闭模式，停止接受新请求（即使未发送 Connection: close）
 			return
 		}
 
+		// 设置空闲超时：在等待下一个请求期间，若超时则关闭连接
 		if d := c.server.idleTimeout(); d > 0 {
 			c.rwc.SetReadDeadline(time.Now().Add(d))
 		} else {
@@ -2142,10 +2225,13 @@ func (c *conn) serve(ctx context.Context) {
 		// read the next request. This prevents a ReadHeaderTimeout or
 		// ReadTimeout from starting until the first bytes of the next request
 		// have been received.
+		// 通过 Peek(4) 阻塞等待下一个请求的首字节到达，再进入下一轮循环。
+		// 这样可以确保 ReadHeaderTimeout/ReadTimeout 只在真正开始读取请求后才开始计时。
 		if _, err := c.bufr.Peek(4); err != nil {
 			return
 		}
 
+		// 下一个请求的数据已到达，清除空闲超时，进入正常读取流程
 		c.rwc.SetReadDeadline(time.Time{})
 	}
 }
@@ -2692,38 +2778,52 @@ func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 // If there is a matching handler, it returns it and the pattern that matched.
 // Otherwise it returns a Redirect or NotFound handler with the path that would match
 // after the redirect.
+// findHandler 为请求查找最匹配的 Handler。
+// 返回值：匹配到的 Handler、pattern 字符串、已编译的 pattern 对象、通配符捕获值列表。
+// 若无精确匹配，则返回重定向 Handler 或 NotFound/MethodNotAllowed Handler。
 func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *pattern, matches []string) {
 	var n *routingNode
 	host := r.URL.Host
-	escapedPath := r.URL.EscapedPath()
+	escapedPath := r.URL.EscapedPath() // 保留原始百分号编码形式，用于后续路径对比
 	path := escapedPath
 	// CONNECT requests are not canonicalized.
+	// CONNECT 请求用于建立隧道（如 HTTPS 代理），目标是"host:port"而非普通 URL，
+	// 不做路径清理（cleanPath），否则会破坏 host:port 格式。
 	if r.Method == "CONNECT" {
 		// If r.URL.Path is /tree and its handler is not registered,
 		// the /tree -> /tree/ redirect applies to CONNECT requests
 		// but the path canonicalization does not.
+		// 先用 r.URL.Host 尝试匹配，检测是否需要尾斜杠重定向（/tree → /tree/）。
+		// CONNECT 支持尾斜杠重定向，但不做路径规范化。
 		_, _, u := mux.matchOrRedirect(host, r.Method, path, r.URL)
 		if u != nil {
 			return RedirectHandler(u.String(), StatusMovedPermanently), u.Path, nil, nil
 		}
 		// Redo the match, this time with r.Host instead of r.URL.Host.
 		// Pass a nil URL to skip the trailing-slash redirect logic.
+		// 第二次匹配改用 r.Host（含端口），传 nil URL 禁止再触发尾斜杠重定向逻辑。
 		n, matches, _ = mux.matchOrRedirect(r.Host, r.Method, path, nil)
 	} else {
 		// All other requests have any port stripped and path cleaned
 		// before passing to mux.handler.
+		// 普通请求：剥离 Host 中的端口，并对路径做规范化（消除 ./ ../ 和多余斜杠）
 		host = stripHostPort(r.Host)
 		path = cleanPath(path)
 
 		// If the given path is /tree and its handler is not registered,
 		// redirect for /tree/.
+		// 在路由树中查找匹配节点；若注册了 /tree/ 但请求路径是 /tree，
+		// matchOrRedirect 会返回重定向目标 URL（u != nil）。
 		var u *url.URL
 		n, matches, u = mux.matchOrRedirect(host, r.Method, path, r.URL)
 		if u != nil {
+			// 需要尾斜杠重定向，301 跳转到带斜杠的路径
 			return RedirectHandler(u.String(), StatusMovedPermanently), n.pattern.String(), nil, nil
 		}
 		if path != escapedPath {
 			// Redirect to cleaned path.
+			// cleanPath 修改了路径（如 /a//b → /a/b），需要 301 重定向到清理后的路径，
+			// 保证客户端 URL 与服务端路由保持一致。
 			patStr := ""
 			if n != nil {
 				patStr = n.pattern.String()
@@ -2736,15 +2836,21 @@ func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *patte
 		// We didn't find a match with the request method. To distinguish between
 		// Not Found and Method Not Allowed, see if there is another pattern that
 		// matches except for the method.
+		// 路由树中找不到匹配节点。
+		// 区分两种情况：路径完全不存在（404）vs 路径存在但 Method 不对（405）。
 		allowedMethods := mux.matchingMethods(host, path)
 		if len(allowedMethods) > 0 {
+			// 该路径有其他 Method 的注册 Handler，说明是方法不被允许，返回 405
+			// 并在 Allow 响应头中列出所有支持的方法。
 			return HandlerFunc(func(w ResponseWriter, r *Request) {
 				w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
 				Error(w, StatusText(StatusMethodNotAllowed), StatusMethodNotAllowed)
 			}), "", nil, nil
 		}
+		// 路径和方法都没有匹配，返回 404 Not Found Handler
 		return NotFoundHandler(), "", nil, nil
 	}
+	// 匹配成功，返回路由节点上的 Handler、pattern 信息和通配符捕获值
 	return n.handler, n.pattern.String(), n.pattern, matches
 }
 
@@ -2844,7 +2950,10 @@ func (mux *ServeMux) matchingMethods(host, path string) []string {
 
 // ServeHTTP dispatches the request to the handler whose
 // pattern most closely matches the request URL.
+// ServeHTTP 是 ServeMux 实现 Handler 接口的入口，负责将请求派发给最匹配的已注册 Handler。
 func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+	// OPTIONS * 是 HTTP/1.1 的全局选项请求（RFC 9110 §9.3.7），
+	// ServeMux 不支持路由此类请求，直接返回 400 拒绝。
 	if r.RequestURI == "*" {
 		if r.ProtoAtLeast(1, 1) {
 			w.Header().Set("Connection", "close")
@@ -2854,10 +2963,15 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 	}
 	var h Handler
 	if use121 {
+		// Go 1.21 兼容模式：使用旧版路由逻辑（仅支持前缀匹配，不支持 Method 匹配）
 		h, _ = mux.mux121.findHandler(r)
 	} else {
+		// Go 1.22+ 新版路由：支持 "METHOD /path/{wildcard}" 语法，
+		// 同时将匹配到的 pattern 字符串、已编译的 pattern 对象和通配符捕获值
+		// 写回请求，供 Handler 内部通过 r.PathValue() 等方法读取。
 		h, r.Pattern, r.pat, r.matches = mux.findHandler(r)
 	}
+	// 调用匹配到的 Handler（可能是用户注册的函数、NotFoundHandler 或 RedirectHandler）
 	h.ServeHTTP(w, r)
 }
 
@@ -2898,31 +3012,46 @@ func Handle(pattern string, handler Handler) {
 
 // HandleFunc registers the handler function for the given pattern in [DefaultServeMux].
 // The documentation for [ServeMux] explains how patterns are matched.
+// HandleFunc 将一个普通函数注册为 DefaultServeMux 上指定 pattern 的处理函数。
+// 内部通过 HandlerFunc 类型转换，使函数满足 Handler 接口。
 func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
 	if use121 {
+		// Go 1.21 兼容模式，走旧版路由实现
 		DefaultServeMux.mux121.handleFunc(pattern, handler)
 	} else {
+		// 将普通函数包装为 HandlerFunc（实现了 Handler 接口），再注册到路由树
 		DefaultServeMux.register(pattern, HandlerFunc(handler))
 	}
 }
 
+// register 是 Handle/HandleFunc 的统一内部入口，注册失败时直接 panic。
+// 调用者（Handle/HandleFunc）是公开 API，panic 比返回 error 更合适——
+// 路由冲突属于编程错误，应在启动阶段暴露，而非运行时静默忽略。
 func (mux *ServeMux) register(pattern string, handler Handler) {
 	if err := mux.registerErr(pattern, handler); err != nil {
 		panic(err)
 	}
 }
 
+// registerErr 是路由注册的核心实现，包含参数校验、pattern 解析、冲突检测和写入路由树。
+// 返回 error 而非 panic，便于上层（如 Handle/HandleFunc 的测试）按需处理错误。
 func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
+	// ── 参数校验 ──────────────────────────────────────────────────
 	if patstr == "" {
 		return errors.New("http: invalid pattern")
 	}
 	if handler == nil {
 		return errors.New("http: nil handler")
 	}
+	// HandlerFunc 是函数类型，需单独判断其底层值是否为 nil，
+	// 因为接口非 nil 不代表接口内的函数值非 nil。
 	if f, ok := handler.(HandlerFunc); ok && f == nil {
 		return errors.New("http: nil handler")
 	}
 
+	// ── 解析 pattern ──────────────────────────────────────────────
+	// parsePattern 将字符串解析为结构化的 *pattern 对象，
+	// 支持 "METHOD /path/{wildcard}" 语法（Go 1.22+）。
 	pat, err := parsePattern(patstr)
 	if err != nil {
 		return fmt.Errorf("parsing %q: %w", patstr, err)
@@ -2930,6 +3059,8 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 
 	// Get the caller's location, for better conflict error messages.
 	// Skip register and whatever calls it.
+	// 记录调用者的源码位置（文件:行号），用于冲突错误信息中精准定位是哪行代码注册了冲突的 pattern。
+	// runtime.Caller(3)：跳过 registerErr → register → Handle/HandleFunc，直接拿到用户代码位置。
 	_, file, line, ok := runtime.Caller(3)
 	if !ok {
 		pat.loc = "unknown location"
@@ -2937,9 +3068,13 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 		pat.loc = fmt.Sprintf("%s:%d", file, line)
 	}
 
+	// ── 冲突检测 + 写入路由树（加锁保护）────────────────────────
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 	// Check for conflict.
+	// 在已注册的 pattern 中筛选出"可能冲突"的候选集（由 index 加速），
+	// 再逐一调用 conflictsWith 做精确判断。
+	// 冲突定义：两个 pattern 能匹配同一个请求，且无法确定哪个更具体。
 	if err := mux.index.possiblyConflictingPatterns(pat, func(pat2 *pattern) error {
 		if pat.conflictsWith(pat2) {
 			d := describeConflict(pat, pat2)
@@ -2950,7 +3085,9 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 	}); err != nil {
 		return err
 	}
+	// 将 pattern 和对应的 Handler 插入前缀路由树（用于请求时的快速匹配）
 	mux.tree.addPattern(pat, handler)
+	// 将 pattern 加入索引（用于冲突检测的候选集筛选，避免全量扫描）
 	mux.index.addPattern(pat)
 	return nil
 }
@@ -3329,15 +3466,15 @@ type serverHandler struct {
 //
 //go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
 func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
-	handler := sh.srv.Handler
+	handler := sh.srv.Handler // 取 Server.Handler 字段 这里的 srv.Handler 就是 http.ListenAndServe(addr, myHandler) 的第二个参数。
 	if handler == nil {
-		handler = DefaultServeMux
+		handler = DefaultServeMux // 没有就用全局默认的
 	}
-	if !sh.srv.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == "OPTIONS" {
+	if !sh.srv.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == "OPTIONS" { // OPTIONS * 特殊处理
 		handler = globalOptionsHandler{}
 	}
 
-	handler.ServeHTTP(rw, req)
+	handler.ServeHTTP(rw, req) // 进入用户 Handler
 }
 
 func badServeHTTP(serverHandler, ResponseWriter, *Request)

@@ -186,19 +186,26 @@ func isCTL(b byte) bool {
 // HTTP/2 imposes the additional restriction that uppercase ASCII
 // letters are not allowed.
 //
+// ValidHeaderFieldName 判断 v 是否为合法的 HTTP/1.x header 字段名。
+// HTTP/2 在此基础上增加了额外限制：不允许出现 ASCII 大写字母。
+//
 // RFC 7230 says:
+// RFC 7230 定义：
 //
 //	header-field   = field-name ":" OWS field-value OWS
 //	field-name     = token
 //	token          = 1*tchar
 //	tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 //	        "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+//	// tchar：合法的 token 字符，包括部分标点、数字和字母（不含控制字符与空白）
 func ValidHeaderFieldName(v string) bool {
 	if len(v) == 0 {
+		// 空字符串不是合法的 token
 		return false
 	}
 	for i := 0; i < len(v); i++ {
 		if !isTokenTable[v[i]] {
+			// 遇到非 tchar 字符，立即返回 false
 			return false
 		}
 	}

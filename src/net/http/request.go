@@ -841,6 +841,15 @@ func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
 	return int(maj), int(min), true
 }
 
+// validMethod 判断 method 是否为合法的 HTTP 方法名。
+// 合法性由 RFC 2616 的 token 规则定义：非空、且不含控制字符或分隔符。
+// 除标准方法（GET/POST 等）外，也允许自定义扩展方法（extension-method），
+// 只要其满足 token 语法即可。
+// 举例：
+//   - "GET /api" → method = "GET"，合法，继续解析。
+//   - "get /api" → method = "get"，小写也是合法 token，通过（HTTP method 大小写敏感，但 token 规则本身不限制大小写）。
+//   - "G E T /api" → 第一个空格已切割，method = "G"，剩余 "E T /api" 作为路径，method 合法但语义上是用户的笔误，不会在这里报错。
+//   - "inv@lid /api" → @ 不是合法 token 字符，validMethod 返回 false，这里报错 invalid method "inv@lid"。
 func validMethod(method string) bool {
 	/*
 	     Method         = "OPTIONS"                ; Section 9.2
@@ -854,6 +863,7 @@ func validMethod(method string) bool {
 	                    | extension-method
 	   extension-method = token
 	     token          = 1*<any CHAR except CTLs or separators>
+	     // 即：token 为一个或多个"非控制字符且非分隔符"的字节序列
 	*/
 	return isToken(method)
 }

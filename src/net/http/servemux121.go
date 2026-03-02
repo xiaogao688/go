@@ -49,30 +49,42 @@ type muxEntry struct {
 }
 
 // Formerly ServeMux.Handle.
+// handle 是 Go 1.21 版本的路由注册实现，对应新版的 registerErr。
+// 注册流程：参数校验 → 写入 map → 尾斜杠路由追加有序列表 → 标记含主机名路由。
 func (mux *serveMux121) handle(pattern string, handler Handler) {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 
+	// ── 参数校验（校验失败直接 panic，路由注册错误属于编程错误）────
 	if pattern == "" {
 		panic("http: invalid pattern")
 	}
 	if handler == nil {
 		panic("http: nil handler")
 	}
+	// 旧版不允许同一 pattern 重复注册（新版 Go 1.22+ 改为冲突检测）
 	if _, exist := mux.m[pattern]; exist {
 		panic("http: multiple registrations for " + pattern)
 	}
 
+	// ── 写入路由表 ─────────────────────────────────────────────────
 	if mux.m == nil {
 		mux.m = make(map[string]muxEntry)
 	}
 	e := muxEntry{h: handler, pattern: pattern}
+	// 所有路由均存入 map，用于精确匹配（O(1) 查找）
 	mux.m[pattern] = e
 	if pattern[len(pattern)-1] == '/' {
+		// 以 '/' 结尾的 pattern 为前缀路由（如 "/static/"），
+		// 追加到按长度降序排列的 es 切片，匹配时从最长前缀开始查找，
+		// 保证更具体的路由优先于更短的前缀路由。
 		mux.es = appendSorted(mux.es, e)
 	}
 
+	// ── 标记含主机名的路由 ─────────────────────────────────────────
 	if pattern[0] != '/' {
+		// pattern 不以 '/' 开头，说明包含主机名（如 "example.com/path"），
+		// 置 hosts=true 以便查找时额外进行 host 匹配。
 		mux.hosts = true
 	}
 }

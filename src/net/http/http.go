@@ -124,8 +124,11 @@ func isNotToken(r rune) bool {
 }
 
 // isToken reports whether v is a valid token (https://www.rfc-editor.org/rfc/rfc2616#section-2.2).
+// isToken 判断 v 是否为合法的 RFC 2616 token（用于校验 HTTP 方法名、header 字段名等）。
 func isToken(v string) bool {
 	// For historical reasons, this function is called ValidHeaderFieldName (see issue #67031).
+	// 由于历史原因，底层实现复用了 ValidHeaderFieldName（见 issue #67031）。
+	// token 与 header field name 使用相同的字符集规则，因此可以共享同一校验逻辑。
 	return httpguts.ValidHeaderFieldName(v)
 }
 
