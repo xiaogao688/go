@@ -14,24 +14,21 @@ import (
 	"unicode"
 )
 
-// A pattern is something that can be matched against an HTTP request.
-// It has an optional method, an optional host, and a path.
+// pattern 表示可以与 HTTP 请求进行匹配的模式。
+// 它包含可选的请求方法、可选的主机名和路径。
 type pattern struct {
-	str    string // original string
+	str    string // 原始字符串
 	method string
 	host   string
-	// The representation of a path differs from the surface syntax, which
-	// simplifies most algorithms.
+	// 路径的内部表示与表面语法不同，这样可以简化大多数算法。
 	//
-	// Paths ending in '/' are represented with an anonymous "..." wildcard.
-	// For example, the path "a/" is represented as a literal segment "a" followed
-	// by a segment with multi==true.
+	// 以 '/' 结尾的路径用一个匿名的 "..." 通配符表示。
+	// 例如，路径 "a/" 被表示为字面量段 "a" 后跟一个 multi==true 的段。
 	//
-	// Paths ending in "{$}" are represented with the literal segment "/".
-	// For example, the path "a/{$}" is represented as a literal segment "a" followed
-	// by a literal segment "/".
+	// 以 "{$}" 结尾的路径用字面量段 "/" 表示。
+	// 例如，路径 "a/{$}" 被表示为字面量段 "a" 后跟字面量段 "/"。
 	segments []segment
-	loc      string // source location of registering call, for helpful messages
+	loc      string // 注册调用的源码位置，用于生成有帮助的错误信息
 }
 
 func (p *pattern) String() string { return p.str }
@@ -40,28 +37,27 @@ func (p *pattern) lastSegment() segment {
 	return p.segments[len(p.segments)-1]
 }
 
-// A segment is a pattern piece that matches one or more path segments, or
-// a trailing slash.
+// segment 是模式中的一个片段，可以匹配一个或多个路径段，或者尾部的斜杠。
 //
-// If wild is false, it matches a literal segment, or, if s == "/", a trailing slash.
-// Examples:
+// 若 wild 为 false，则匹配字面量路径段；若 s == "/"，则匹配尾部斜杠。
+// 示例：
 //
 //	"a" => segment{s: "a"}
 //	"/{$}" => segment{s: "/"}
 //
-// If wild is true and multi is false, it matches a single path segment.
-// Example:
+// 若 wild 为 true 且 multi 为 false，则匹配单个路径段。
+// 示例：
 //
 //	"{x}" => segment{s: "x", wild: true}
 //
-// If both wild and multi are true, it matches all remaining path segments.
-// Example:
+// 若 wild 和 multi 均为 true，则匹配所有剩余路径段。
+// 示例：
 //
 //	"{rest...}" => segment{s: "rest", wild: true, multi: true}
 type segment struct {
-	s     string // literal or wildcard name or "/" for "/{$}".
+	s     string // 字面量或通配符名称，或 "/" 表示 "/{$}"
 	wild  bool
-	multi bool // "..." wildcard
+	multi bool // "..." 通配符
 }
 
 // parsePattern parses a string into a Pattern.
