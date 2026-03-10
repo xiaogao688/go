@@ -578,12 +578,15 @@ func validateHeaders(hdrs Header) string {
 	return ""
 }
 
-// roundTrip implements a RoundTripper over HTTP.
+// roundTrip 实现了基于 HTTP 的 RoundTripper 接口。
 func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
+	// 确保 HTTP/2 等备用协议的默认值只被初始化一次
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	ctx := req.Context()
+	// 获取请求上下文中的 httptrace，用于追踪请求各阶段的事件
 	trace := httptrace.ContextClientTrace(ctx)
 
+	// 基础校验：URL 和 Header 不能为 nil
 	if req.URL == nil {
 		req.closeBody()
 		return nil, errors.New("http: nil Request.URL")
@@ -595,22 +598,26 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 	scheme := req.URL.Scheme
 	isHTTP := scheme == "http" || scheme == "https"
 	if isHTTP {
-		// Validate the outgoing headers.
+		// 校验出站请求头的合法性
 		if err := validateHeaders(req.Header); err != "" {
 			req.closeBody()
 			return nil, fmt.Errorf("net/http: invalid header %s", err)
 		}
 
-		// Validate the outgoing trailers too.
+		// 同时校验出站 Trailer 头的合法性
 		if err := validateHeaders(req.Trailer); err != "" {
 			req.closeBody()
 			return nil, fmt.Errorf("net/http: invalid trailer %s", err)
 		}
 	}
 
+	// 保存原始请求引用，并将 req 包装为支持 body 回绕（rewind）的版本，
+	// 以便在重定向或重试时重新读取请求体。
 	origReq := req
 	req = setupRewindBody(req)
 
+	// 尝试使用备用协议的 RoundTripper（如 HTTP/2、QUIC 等）发送请求。
+	// 若备用 RoundTripper 返回 ErrSkipAltProtocol，则回绕 body 并继续走标准 HTTP 流程。
 	if altRT := t.alternateRoundTripper(req); altRT != nil {
 		if resp, err := altRT.RoundTrip(req); err != ErrSkipAltProtocol {
 			return resp, err
@@ -621,48 +628,52 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 			return nil, err
 		}
 	}
+	// 备用协议未处理，且协议既非 http 也非 https，则报错
 	if !isHTTP {
 		req.closeBody()
 		return nil, badStringError("unsupported protocol scheme", scheme)
 	}
+	// 校验 HTTP 方法的合法性
 	if req.Method != "" && !validMethod(req.Method) {
 		req.closeBody()
 		return nil, fmt.Errorf("net/http: invalid method %q", req.Method)
 	}
+	// 校验目标 Host 不为空
 	if req.URL.Host == "" {
 		req.closeBody()
 		return nil, errors.New("http: no Host in request URL")
 	}
 
-	// Transport request context.
+	// 为本次 Transport 请求创建一个独立的可取消 context。
 	//
-	// If RoundTrip returns an error, it cancels this context before returning.
+	// 若 RoundTrip 返回错误，则在返回前取消此 context。
 	//
-	// If RoundTrip returns no error:
-	//   - For an HTTP/1 request, persistConn.readLoop cancels this context
-	//     after reading the request body.
-	//   - For an HTTP/2 request, RoundTrip cancels this context after the HTTP/2
-	//     RoundTripper returns.
+	// 若 RoundTrip 成功返回：
+	//   - 对于 HTTP/1 请求，persistConn.readLoop 在读取完响应体后取消此 context。
+	//   - 对于 HTTP/2 请求，RoundTrip 在 HTTP/2 RoundTripper 返回后取消此 context。
 	ctx, cancel := context.WithCancelCause(req.Context())
 
-	// Convert Request.Cancel into context cancelation.
+	// 将旧版 Request.Cancel channel 转换为 context 取消机制
 	if origReq.Cancel != nil {
 		go awaitLegacyCancel(ctx, cancel, origReq)
 	}
 
-	// Convert Transport.CancelRequest into context cancelation.
+	// 将旧版 Transport.CancelRequest 转换为 context 取消机制。
 	//
-	// This is lamentably expensive. CancelRequest has been deprecated for a long time
-	// and doesn't work on HTTP/2 requests. Perhaps we should drop support for it entirely.
+	// 这个适配代价较高。CancelRequest 已被废弃很久，且对 HTTP/2 请求无效。
+	// 未来可能会完全移除对它的支持。
 	cancel = t.prepareTransportCancel(origReq, cancel)
 
+	// 若函数因错误返回，确保 context 被取消，释放相关资源
 	defer func() {
 		if err != nil {
 			cancel(err)
 		}
 	}()
 
+	// 重试循环：每次尝试获取连接并发送请求，失败时判断是否可以重试
 	for {
+		// 在每次循环开始时检查 context 是否已被取消（超时或外部取消）
 		select {
 		case <-ctx.Done():
 			req.closeBody()
@@ -670,18 +681,18 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 		default:
 		}
 
-		// treq gets modified by roundTrip, so we need to recreate for each retry.
+		// treq 会在 roundTrip 中被修改，因此每次重试都需要重新创建
 		treq := &transportRequest{Request: req, trace: trace, ctx: ctx, cancel: cancel}
+		// 根据请求计算连接方式（直连、代理等）
 		cm, err := t.connectMethodForRequest(treq)
 		if err != nil {
 			req.closeBody()
 			return nil, err
 		}
 
-		// Get the cached or newly-created connection to either the
-		// host (for http or https), the http proxy, or the http proxy
-		// pre-CONNECTed to https server. In any case, we'll be ready
-		// to send it requests.
+		// 获取一个可用连接：可能是缓存的复用连接，也可能是新建的连接。
+		// 目标可以是直连的 http/https 主机、HTTP 代理，
+		// 或已通过 CONNECT 隧道建立到 https 服务器的代理连接。
 		pconn, err := t.getConn(treq, cm)
 		if err != nil {
 			req.closeBody()
@@ -690,32 +701,33 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 
 		var resp *Response
 		if pconn.alt != nil {
-			// HTTP/2 path.
+			// HTTP/2 路径：使用备用 RoundTripper（如 http2Transport）发送请求
 			resp, err = pconn.alt.RoundTrip(req)
 		} else {
+			// HTTP/1 路径：通过持久连接发送请求
 			resp, err = pconn.roundTrip(treq)
 		}
 		if err == nil {
 			if pconn.alt != nil {
-				// HTTP/2 requests are not cancelable with CancelRequest,
-				// so we have no further need for the request context.
+				// HTTP/2 请求无法通过 CancelRequest 取消，
+				// 因此请求完成后不再需要维持此 context，直接取消。
 				//
-				// On the HTTP/1 path, roundTrip takes responsibility for
-				// canceling the context after the response body is read.
+				// HTTP/1 路径下，roundTrip 负责在响应体读取完毕后取消 context。
 				cancel(errRequestDone)
 			}
+			// 将响应关联回原始请求（而非可能被修改过的 req）
 			resp.Request = origReq
 			return resp, nil
 		}
 
-		// Failed. Clean up and determine whether to retry.
+		// 请求失败，清理资源并判断是否需要重试。
 		if http2isNoCachedConnError(err) {
+			// HTTP/2 连接缓存失效，从空闲连接池中移除并减少该 host 的连接计数
 			if t.removeIdleConn(pconn) {
 				t.decConnsPerHost(pconn.cacheKey)
 			}
 		} else if !pconn.shouldRetryRequest(req, err) {
-			// Issue 16465: return underlying net.Conn.Read error from peek,
-			// as we've historically done.
+			// Issue 16465：与历史行为保持一致，返回 peek 时底层 net.Conn.Read 的原始错误
 			if e, ok := err.(nothingWrittenError); ok {
 				err = e.error
 			}
@@ -723,16 +735,16 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 				err = e.err
 			}
 			if b, ok := req.Body.(*readTrackingBody); ok && !b.didClose {
-				// Issue 49621: Close the request body if pconn.roundTrip
-				// didn't do so already. This can happen if the pconn
-				// write loop exits without reading the write request.
+				// Issue 49621：若 pconn.roundTrip 尚未关闭请求体（例如写循环在
+				// 读取写请求之前退出），则在此处主动关闭。
 				req.closeBody()
 			}
 			return nil, err
 		}
+		// 触发测试钩子，通知重试发生（仅用于测试）
 		testHookRoundTripRetried()
 
-		// Rewind the body if we're able to.
+		// 若支持，将请求体回绕到起始位置以供重试读取
 		req, err = rewindBody(req)
 		if err != nil {
 			return nil, err
