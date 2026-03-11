@@ -6,31 +6,38 @@ package http
 
 import "math"
 
-// A routingIndex optimizes conflict detection by indexing patterns.
+// routingIndex 通过对 pattern 建立索引来加速冲突检测。
 //
-// The basic idea is to rule out patterns that cannot conflict with a given
-// pattern because they have a different literal in a corresponding segment.
-// See the comments in [routingIndex.possiblyConflictingPatterns] for more details.
+// 核心思路：若两个 pattern 在同一段位置上各自拥有不同的字面量值，
+// 则它们不可能冲突，可以直接排除，无需进行完整的冲突比对。
+// 详见 [routingIndex.possiblyConflictingPatterns] 中的注释。
+/*
+核心逻辑可以这样理解：
+	- routingIndex 是一个"剪枝索引"，注册新 pattern 时不需要跟所有已注册的 pattern 逐一比对，而是先通过索引快速过滤掉"必然不冲突"的那些，只对剩余的"可能冲突"候选者做精确判断。
+	- segments 字段是剪枝的关键：如果新 pattern 在第 N 段是字面量 "foo"，那么任何在第 N 段是字面量但值不是 "foo" 的 pattern，必然与它互斥，可以直接跳过。
+	- multis 字段单独处理以 {name...} 或尾部 / 结尾的 pattern，因为这类 pattern 能跨越任意段数，无法用段位置索引来剪枝，但数量通常很少，直接遍历即可。
+	- routingIndexKey 中 s 为空字符串时表示通配符，这类 pattern 也不参与字面量索引（通配符能匹配任意值，不能用来剪枝）。
+*/
 type routingIndex struct {
-	// map from a particular segment position and value to all registered patterns
-	// with that value in that position.
-	// For example, the key {1, "b"} would hold the patterns "/a/b" and "/a/b/c"
-	// but not "/a", "b/a", "/a/c" or "/a/{x}".
+	// segments 是一个从"(段位置, 字面量值)"到"所有在该位置上含有该字面量的 pattern 列表"的映射。
+	// 例如，key {pos:1, s:"b"} 会索引 "/a/b" 和 "/a/b/c"，
+	// 但不会索引 "/a"、"/b/a"、"/a/c" 或 "/a/{x}"（后者是通配符，不是字面量）。
 	segments map[routingIndexKey][]*pattern
-	// All patterns that end in a multi wildcard (including trailing slash).
-	// We do not try to be clever about indexing multi patterns, because there
-	// are unlikely to be many of them.
+
+	// multis 存储所有以多段通配符（"..."）或尾部斜杠结尾的 pattern。
+	// 对这类 pattern 不做精细索引，因为实际注册的数量通常极少，暴力遍历即可。
 	multis []*pattern
 }
 
+// routingIndexKey 是 segments 索引的键，唯一标识"某个段位置上的某个字面量"。
 type routingIndexKey struct {
-	pos int    // 0-based segment position
-	s   string // literal, or empty for wildcard
+	pos int    // 段的位置，从 0 开始计数
+	s   string // 字面量值；若为空字符串，则表示该位置是通配符
 }
 
 func (idx *routingIndex) addPattern(pat *pattern) {
-	if pat.lastSegment().multi {
-		idx.multis = append(idx.multis, pat)
+	if pat.lastSegment().multi { // 通配符
+		idx.multis = append(idx.multis, pat) // 加入到通配符匹配
 	} else {
 		if idx.segments == nil {
 			idx.segments = map[routingIndexKey][]*pattern{}

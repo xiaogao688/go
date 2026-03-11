@@ -2981,11 +2981,12 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 // Handle registers the handler for the given pattern.
 // If the given pattern conflicts with one that is already registered, Handle
 // panics.
+// 注意当这里注册url发生冲突时会panic
 func (mux *ServeMux) Handle(pattern string, handler Handler) {
 	if use121 {
-		mux.mux121.handle(pattern, handler)
+		mux.mux121.handle(pattern, handler) // 老版本处理逻辑
 	} else {
-		mux.register(pattern, handler)
+		mux.register(pattern, handler) // 新的处理逻辑
 	}
 }
 

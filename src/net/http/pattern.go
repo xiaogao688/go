@@ -239,175 +239,193 @@ func pathUnescape(path string) string {
 	return u
 }
 
-// relationship is a relationship between two patterns, p1 and p2.
+// relationship 描述两个 pattern（p1 和 p2）之间的匹配关系。
 type relationship string
 
 const (
-	equivalent   relationship = "equivalent"   // both match the same requests
-	moreGeneral  relationship = "moreGeneral"  // p1 matches everything p2 does & more
-	moreSpecific relationship = "moreSpecific" // p2 matches everything p1 does & more
-	disjoint     relationship = "disjoint"     // there is no request that both match
-	overlaps     relationship = "overlaps"     // there is a request that both match, but neither is more specific
+	equivalent   relationship = "equivalent"   // 两者匹配完全相同的请求集合
+	moreGeneral  relationship = "moreGeneral"  // p1 匹配 p2 能匹配的所有请求，且还能匹配更多
+	moreSpecific relationship = "moreSpecific" // p2 匹配 p1 能匹配的所有请求，且还能匹配更多
+	disjoint     relationship = "disjoint"     // 不存在任何请求能同时被两者匹配（互斥）
+	overlaps     relationship = "overlaps"     // 存在请求能同时被两者匹配，但两者互不包含（交叉）
 )
 
-// conflictsWith reports whether p1 conflicts with p2, that is, whether
-// there is a request that both match but where neither is higher precedence
-// than the other.
+// conflictsWith 判断 p1 与 p2 是否冲突，即是否存在某个请求同时被两者匹配，
+// 但两者之间又没有明确的优先级高低。
 //
-//	Precedence is defined by two rules:
-//	1. Patterns with a host win over patterns without a host.
-//	2. Patterns whose method and path is more specific win. One pattern is more
-//	   specific than another if the second matches all the (method, path) pairs
-//	   of the first and more.
+// 优先级由以下两条规则决定：
+//  1. 带有 host 的 pattern 优先于不带 host 的 pattern。
+//  2. method 和 path 更具体的 pattern 优先级更高。若第二个 pattern 匹配的
+//     (method, path) 对是第一个的超集，则第一个更具体。
 //
-// If rule 1 doesn't apply, then two patterns conflict if their relationship
-// is either equivalence (they match the same set of requests) or overlap
-// (they both match some requests, but neither is more specific than the other).
+// 若规则 1 不适用，则当两个 pattern 的关系为"等价"（匹配完全相同的请求集合）
+// 或"交叉"（各自能匹配对方不能匹配的请求，但又有公共交集）时，认为它们冲突。
 func (p1 *pattern) conflictsWith(p2 *pattern) bool {
 	if p1.host != p2.host {
-		// Either one host is empty and the other isn't, in which case the
-		// one with the host wins by rule 1, or neither host is empty
-		// and they differ, so they won't match the same paths.
+		// 两者 host 不同：要么一个有 host 一个没有（有 host 的按规则 1 获胜，不冲突），
+		// 要么两者都有 host 但值不同（不可能匹配同一路径，不冲突）。
 		return false
 	}
 	rel := p1.comparePathsAndMethods(p2)
+	// 等价或交叉均构成冲突
 	return rel == equivalent || rel == overlaps
 }
 
+// comparePathsAndMethods 综合比较两个 pattern 在 method 和 path 两个维度上的关系。
 func (p1 *pattern) comparePathsAndMethods(p2 *pattern) relationship {
 	mrel := p1.compareMethods(p2)
-	// Optimization: avoid a call to comparePaths.
+	// 优化：method 已经互斥，无需再比较 path，直接返回 disjoint。
 	if mrel == disjoint {
 		return disjoint
 	}
 	prel := p1.comparePaths(p2)
+	// 将 method 关系与 path 关系合并，得到整体关系。
 	return combineRelationships(mrel, prel)
 }
 
-// compareMethods determines the relationship between the method
-// part of patterns p1 and p2.
+// compareMethods 比较两个 pattern 在 method 部分的关系。
 //
-// A method can either be empty, "GET", or something else.
-// The empty string matches any method, so it is the most general.
-// "GET" matches both GET and HEAD.
-// Anything else matches only itself.
+// method 有三种取值：空字符串、"GET" 或其他具体方法。
+//   - 空字符串：匹配任意 method，是最宽泛的。
+//   - "GET"：同时匹配 GET 和 HEAD（Go 路由规范：GET pattern 隐式处理 HEAD）。
+//   - 其他：只匹配自身。
 func (p1 *pattern) compareMethods(p2 *pattern) relationship {
 	if p1.method == p2.method {
+		// 完全相同，等价。
 		return equivalent
 	}
 	if p1.method == "" {
-		// p1 matches any method, but p2 does not, so p1 is more general.
+		// p1 匹配任意 method，p2 有具体限定，p1 更宽泛。
 		return moreGeneral
 	}
 	if p2.method == "" {
+		// p2 匹配任意 method，p1 有具体限定，p1 更具体。
 		return moreSpecific
 	}
 	if p1.method == "GET" && p2.method == "HEAD" {
-		// p1 matches GET and HEAD; p2 matches only HEAD.
+		// p1 匹配 GET 和 HEAD，p2 只匹配 HEAD，p1 更宽泛。
 		return moreGeneral
 	}
 	if p2.method == "GET" && p1.method == "HEAD" {
+		// p2 匹配 GET 和 HEAD，p1 只匹配 HEAD，p1 更具体。
 		return moreSpecific
 	}
+	// 两者都有具体 method 且互不包含，互斥。
 	return disjoint
 }
 
-// comparePaths determines the relationship between the path
-// part of two patterns.
+// comparePaths 比较两个 pattern 在 path 部分的关系。
 func (p1 *pattern) comparePaths(p2 *pattern) relationship {
-	// Optimization: if a path pattern doesn't end in a multi ("...") wildcard, then it
-	// can only match paths with the same number of segments.
+	// 优化：若两个 pattern 均不以多段通配符（"..."）结尾，则只有段数相同时才可能匹配
+	// 相同的路径，段数不同直接互斥。
 	if len(p1.segments) != len(p2.segments) && !p1.lastSegment().multi && !p2.lastSegment().multi {
 		return disjoint
 	}
 
-	// Consider corresponding segments in the two path patterns.
+	// 逐段对比两个 pattern 中对应位置的段，将每段的关系不断合并为整体关系。
 	var segs1, segs2 []segment
 	rel := equivalent
 	for segs1, segs2 = p1.segments, p2.segments; len(segs1) > 0 && len(segs2) > 0; segs1, segs2 = segs1[1:], segs2[1:] {
 		rel = combineRelationships(rel, compareSegments(segs1[0], segs2[0]))
 		if rel == disjoint {
+			// 某段已互斥，整体必然互斥，提前返回。
 			return rel
 		}
 	}
-	// We've reached the end of the corresponding segments of the patterns.
-	// If they have the same number of segments, then we've already determined
-	// their relationship.
+
+	// 两个 pattern 的对应段都已比较完毕。
+	// 若段数相同，前面的循环已得出最终关系，直接返回。
 	if len(segs1) == 0 && len(segs2) == 0 {
 		return rel
 	}
-	// Otherwise, the only way they could fail to be disjoint is if the shorter
-	// pattern ends in a multi. In that case, that multi is more general
-	// than the remainder of the longer pattern, so combine those two relationships.
+
+	// 段数不同时，只有较短的那个以多段通配符结尾，才能匹配较长 pattern 的剩余部分。
+	// 此时多段通配符比剩余的具体段更宽泛，将该"更宽泛"关系并入整体结果。
 	if len(segs1) < len(segs2) && p1.lastSegment().multi {
+		// p1 更短且以 multi 结尾，p1 比 p2 更宽泛。
 		return combineRelationships(rel, moreGeneral)
 	}
 	if len(segs2) < len(segs1) && p2.lastSegment().multi {
+		// p2 更短且以 multi 结尾，p1 比 p2 更具体。
 		return combineRelationships(rel, moreSpecific)
 	}
+	// 段数不同且较短一方不以 multi 结尾，两者互斥。
 	return disjoint
 }
 
-// compareSegments determines the relationship between two segments.
+// compareSegments 比较两个路径段之间的关系。
+// 段的类型从宽泛到具体依次为：多段通配符（multi）> 单段通配符（wild）> 字面量。
 func compareSegments(s1, s2 segment) relationship {
 	if s1.multi && s2.multi {
+		// 两者都是多段通配符，等价。
 		return equivalent
 	}
 	if s1.multi {
+		// s1 是多段通配符，比 s2 更宽泛。
 		return moreGeneral
 	}
 	if s2.multi {
+		// s2 是多段通配符，s1 比 s2 更具体。
 		return moreSpecific
 	}
 	if s1.wild && s2.wild {
+		// 两者都是单段通配符，等价（均匹配任意单段）。
 		return equivalent
 	}
 	if s1.wild {
 		if s2.s == "/" {
-			// A single wildcard doesn't match a trailing slash.
+			// 单段通配符不匹配尾部斜杠（即 {$} 段），互斥。
 			return disjoint
 		}
+		// s1 是单段通配符，比字面量 s2 更宽泛。
 		return moreGeneral
 	}
 	if s2.wild {
 		if s1.s == "/" {
+			// 字面量为尾部斜杠（{$} 段），单段通配符无法匹配，互斥。
 			return disjoint
 		}
+		// s2 是单段通配符，s1 字面量比 s2 更具体。
 		return moreSpecific
 	}
-	// Both literals.
+	// 两者都是字面量，值相同则等价，否则互斥。
 	if s1.s == s2.s {
 		return equivalent
 	}
 	return disjoint
 }
 
-// combineRelationships determines the overall relationship of two patterns
-// given the relationships of a partition of the patterns into two parts.
+// combineRelationships 将两个局部关系合并为整体关系。
+// 用于把 pattern 拆分为多个维度（如 method 和 path）分别比较后，再汇总出最终结论。
 //
-// For example, if p1 is more general than p2 in one way but equivalent
-// in the other, then it is more general overall.
-//
-// Or if p1 is more general in one way and more specific in the other, then
-// they overlap.
+// 合并规则示例：
+//   - 在某维度上 p1 更宽泛，在另一维度上等价 → 整体上 p1 更宽泛。
+//   - 在某维度上 p1 更宽泛，在另一维度上 p1 更具体 → 两者交叉（overlaps）。
 func combineRelationships(r1, r2 relationship) relationship {
 	switch r1 {
 	case equivalent:
+		// r1 等价时，整体关系完全由 r2 决定。
 		return r2
 	case disjoint:
+		// r1 已互斥，整体必然互斥。
 		return disjoint
 	case overlaps:
 		if r2 == disjoint {
+			// 任一维度互斥，整体互斥。
 			return disjoint
 		}
+		// 已有交叉，再叠加任何非互斥关系仍是交叉。
 		return overlaps
 	case moreGeneral, moreSpecific:
 		switch r2 {
 		case equivalent:
+			// r2 等价，整体关系由 r1 决定。
 			return r1
 		case inverseRelationship(r1):
+			// 一个维度 r1 更宽泛，另一个维度 r1 更具体，方向相反 → 交叉。
 			return overlaps
 		default:
+			// 两个维度方向一致（同为更宽泛或同为更具体），整体取 r2（与 r1 相同）。
 			return r2
 		}
 	default:
@@ -415,8 +433,9 @@ func combineRelationships(r1, r2 relationship) relationship {
 	}
 }
 
-// If p1 has relationship `r` to p2, then
-// p2 has inverseRelationship(r) to p1.
+// inverseRelationship 返回关系 r 的逆关系。
+// 若 p1 对 p2 的关系是 r，则 p2 对 p1 的关系是 inverseRelationship(r)。
+// equivalent 和 disjoint 的逆关系是自身。
 func inverseRelationship(r relationship) relationship {
 	switch r {
 	case moreSpecific:
@@ -428,7 +447,8 @@ func inverseRelationship(r relationship) relationship {
 	}
 }
 
-// isLitOrSingle reports whether the segment is a non-dollar literal or a single wildcard.
+// isLitOrSingle 判断一个段是否为"普通字面量"或"单段通配符"，
+// 即排除多段通配符（multi）和表示路径终止的 {$}（s == "/"）。
 func isLitOrSingle(seg segment) bool {
 	if seg.wild {
 		return !seg.multi
@@ -436,18 +456,20 @@ func isLitOrSingle(seg segment) bool {
 	return seg.s != "/"
 }
 
-// describeConflict returns an explanation of why two patterns conflict.
+// describeConflict 返回两个冲突 pattern 的冲突原因描述，用于生成友好的错误信息。
 func describeConflict(p1, p2 *pattern) string {
 	mrel := p1.compareMethods(p2)
 	prel := p1.comparePaths(p2)
 	rel := combineRelationships(mrel, prel)
 	if rel == equivalent {
+		// 两者完全等价，匹配同一请求集合。
 		return fmt.Sprintf("%s matches the same requests as %s", p1, p2)
 	}
 	if rel != overlaps {
 		panic("describeConflict called with non-conflicting patterns")
 	}
 	if prel == overlaps {
+		// path 部分交叉：举出公共路径、以及各自独有的路径示例，帮助开发者定位问题。
 		return fmt.Sprintf(`%[1]s and %[2]s both match some paths, like %[3]q.
 But neither is more specific than the other.
 %[1]s matches %[4]q, but %[2]s doesn't.
@@ -455,21 +477,26 @@ But neither is more specific than the other.
 			p1, p2, commonPath(p1, p2), differencePath(p1, p2), differencePath(p2, p1))
 	}
 	if mrel == moreGeneral && prel == moreSpecific {
+		// method 更宽泛但 path 更具体，两个维度方向相反，导致冲突。
 		return fmt.Sprintf("%s matches more methods than %s, but has a more specific path pattern", p1, p2)
 	}
 	if mrel == moreSpecific && prel == moreGeneral {
+		// method 更具体但 path 更宽泛，两个维度方向相反，导致冲突。
 		return fmt.Sprintf("%s matches fewer methods than %s, but has a more general path pattern", p1, p2)
 	}
 	return fmt.Sprintf("bug: unexpected way for two patterns %s and %s to conflict: methods %s, paths %s", p1, p2, mrel, prel)
 }
 
-// writeMatchingPath writes to b a path that matches the segments.
+// writeMatchingPath 将 segs 中所有段对应的路径文本依次写入 b，
+// 生成一个能被这些段匹配的示例路径字符串。
 func writeMatchingPath(b *strings.Builder, segs []segment) {
 	for _, s := range segs {
 		writeSegment(b, s)
 	}
 }
 
+// writeSegment 将单个段写入 b：始终先写 '/'，
+// 若为多段通配符（multi）或 {$} 段（s == "/"）则只写斜杠，否则再追加段的文本内容。
 func writeSegment(b *strings.Builder, s segment) {
 	b.WriteByte('/')
 	if !s.multi && s.s != "/" {
@@ -477,18 +504,22 @@ func writeSegment(b *strings.Builder, s segment) {
 	}
 }
 
-// commonPath returns a path that both p1 and p2 match.
-// It assumes there is such a path.
+// commonPath 返回一个同时被 p1 和 p2 匹配的示例路径。
+// 调用前提：此类路径确实存在。
 func commonPath(p1, p2 *pattern) string {
 	var b strings.Builder
 	var segs1, segs2 []segment
 	for segs1, segs2 = p1.segments, p2.segments; len(segs1) > 0 && len(segs2) > 0; segs1, segs2 = segs1[1:], segs2[1:] {
 		if s1 := segs1[0]; s1.wild {
+			// s1 是通配符，用 s2 的具体值填充，确保同时满足两者。
 			writeSegment(&b, segs2[0])
 		} else {
+			// s1 是字面量，直接使用。
 			writeSegment(&b, s1)
 		}
 	}
+	// 处理段数不等的情况（较短一方以 multi 结尾）：
+	// 追加较长一方剩余段的示例路径。
 	if len(segs1) > 0 {
 		writeMatchingPath(&b, segs1)
 	} else if len(segs2) > 0 {
@@ -497,8 +528,8 @@ func commonPath(p1, p2 *pattern) string {
 	return b.String()
 }
 
-// differencePath returns a path that p1 matches and p2 doesn't.
-// It assumes there is such a path.
+// differencePath 返回一个被 p1 匹配、但不被 p2 匹配的示例路径。
+// 调用前提：此类路径确实存在。
 func differencePath(p1, p2 *pattern) string {
 	var b strings.Builder
 
@@ -507,20 +538,19 @@ func differencePath(p1, p2 *pattern) string {
 		s1 := segs1[0]
 		s2 := segs2[0]
 		if s1.multi && s2.multi {
-			// From here the patterns match the same paths, so we must have found a difference earlier.
+			// 从此段开始两者匹配的路径集合相同，差异必然已在前面的段中体现，
+			// 补一个 '/' 收尾即可。
 			b.WriteByte('/')
 			return b.String()
-
 		}
 		if s1.multi && !s2.multi {
-			// s1 ends in a "..." wildcard but s2 does not.
-			// A trailing slash will distinguish them, unless s2 ends in "{$}",
-			// in which case any segment will do; prefer the wildcard name if
-			// it has one.
+			// s1 是多段通配符，s2 不是，说明 s1 能匹配更多路径。
+			// 用尾部斜杠（空的多段匹配）来区分两者，
+			// 但若 s2 是 {$} 段，则需要追加一个额外的路径段才能被 s1 匹配而不被 s2 匹配。
 			b.WriteByte('/')
 			if s2.s == "/" {
 				if s1.s != "" {
-					b.WriteString(s1.s)
+					b.WriteString(s1.s) // 优先使用通配符名作为示例段
 				} else {
 					b.WriteString("x")
 				}
@@ -528,16 +558,15 @@ func differencePath(p1, p2 *pattern) string {
 			return b.String()
 		}
 		if !s1.multi && s2.multi {
+			// s2 是多段通配符而 s1 不是，直接写入 s1 的具体段。
 			writeSegment(&b, s1)
 		} else if s1.wild && s2.wild {
-			// Both patterns will match whatever we put here; use
-			// the first wildcard name.
+			// 两者都是单段通配符，填什么都能同时匹配，使用 s1 的通配符名。
 			writeSegment(&b, s1)
 		} else if s1.wild && !s2.wild {
-			// s1 is a wildcard, s2 is a literal.
-			// Any segment other than s2.s will work.
-			// Prefer the wildcard name, but if it's the same as the literal,
-			// tweak the literal.
+			// s1 是通配符，s2 是字面量。
+			// 任何不等于 s2.s 的值都能被 s1 匹配而不被 s2 匹配。
+			// 优先用通配符名，若恰好与字面量相同则在字面量后追加 "x" 以示区分。
 			if s1.s != s2.s {
 				writeSegment(&b, s1)
 			} else {
@@ -545,10 +574,11 @@ func differencePath(p1, p2 *pattern) string {
 				b.WriteString(s2.s + "x")
 			}
 		} else if !s1.wild && s2.wild {
+			// s1 是字面量，s2 是通配符，s2 能匹配 s1，直接用 s1 的字面量。
 			writeSegment(&b, s1)
 		} else {
-			// Both are literals. A precondition of this function is that the
-			// patterns overlap, so they must be the same literal. Use it.
+			// 两者都是字面量。由于前提是两个 pattern 交叉（overlaps），
+			// 对应位置的字面量必然相同，直接使用即可。
 			if s1.s != s2.s {
 				panic(fmt.Sprintf("literals differ: %q and %q", s1.s, s2.s))
 			}
@@ -556,8 +586,7 @@ func differencePath(p1, p2 *pattern) string {
 		}
 	}
 	if len(segs1) > 0 {
-		// p1 is longer than p2, and p2 does not end in a multi.
-		// Anything that matches the rest of p1 will do.
+		// p1 比 p2 长，且 p2 不以 multi 结尾，追加 p1 剩余段即可满足 p1 而不满足 p2。
 		writeMatchingPath(&b, segs1)
 	} else if len(segs2) > 0 {
 		writeMatchingPath(&b, segs2)
