@@ -24,6 +24,96 @@
 // we will first try to match the path "/a/b/c" with /a/b/z, and
 // when that fails we will try against /a/{x}/c.
 // 匹配路径 "/a/b/c" 时，会先尝试与 /a/b/z 匹配，失败后再尝试与 /a/{x}/c 匹配。
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 决策树结构示意图
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 假设注册了以下 6 条路由：
+//
+//	① example.com GET /admin
+//	② GET /users                   → handleListUsers
+//	③ GET /users/{id}              → handleGetUser      （单段通配符）
+//	④ POST /users                  → handleCreateUser
+//	⑤ GET /files/{path...}         → handleFiles        （多段通配符）
+//	⑥ GET /api/{$}                 → handleAPIRoot      （精确尾部斜线）
+//
+// 构造完成后的决策树（每个节点为一个 routingNode）：
+//
+//	[root]
+//	├── children["example.com"]          ← 第 1 层：host 精确匹配
+//	│   └── children["GET"]              ← 第 2 层：method 精确匹配
+//	│       └── children["admin"]        ← 第 3 层：路径段字面量
+//	│           └── ★ LEAF  pattern="example.com GET /admin"
+//	│
+//	└── emptyChild  (host="")            ← 第 1 层：无 host 限制的通用路由
+//	    ├── children["GET"]              ← 第 2 层：method = GET
+//	    │   ├── children["users"]        ← 第 3 层：字面量 "users"
+//	    │   │   │   ★ LEAF  pattern="GET /users"          ← 路由②（同一节点兼叶+内部）
+//	    │   │   └── emptyChild           ← 第 4 层：单段通配符 {id}，key=""
+//	    │   │       └── ★ LEAF  pattern="GET /users/{id}" ← 路由③
+//	    │   │
+//	    │   ├── children["files"]        ← 第 3 层：字面量 "files"
+//	    │   │   └── multiChild           ← 多段通配符 {path...}，消费剩余整段路径
+//	    │   │       └── ★ LEAF  pattern="GET /files/{path...}" ← 路由⑤
+//	    │   │
+//	    │   └── children["api"]          ← 第 3 层：字面量 "api"
+//	    │       └── children["/"]        ← 第 4 层：尾部斜线段，来自 {$}
+//	    │           └── ★ LEAF  pattern="GET /api/{$}"    ← 路由⑥
+//	    │
+//	    └── children["POST"]             ← 第 2 层：method = POST
+//	        └── children["users"]        ← 第 3 层：字面量 "users"
+//	            └── ★ LEAF  pattern="POST /users"         ← 路由④
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 请求匹配过程示例
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 请求 1：GET /users/42
+//
+//	root
+//	  → emptyChild (host="" 通配)
+//	    → children["GET"]
+//	      → children["users"]            segment="users" 字面量命中
+//	        → findChild("42") = nil       segment="42" 无字面量子节点
+//	        → emptyChild (单段通配符)     segment="42" 被 {id} 捕获，matches=["42"]
+//	          → path="" 且 pattern!=nil  ✓ 命中路由③，返回 handler + ["42"]
+//
+// 请求 2：GET /files/img/logo.png
+//
+//	root → emptyChild → children["GET"]
+//	  → children["files"]                segment="files" 字面量命中
+//	    → findChild("img") = nil          segment="img" 无字面量子节点
+//	    → emptyChild = nil               无单段通配符子节点
+//	    → multiChild                     多段通配符命中，消费剩余路径 "img/logo.png"
+//	      ✓ 命中路由⑤，matches=["img/logo.png"]
+//
+// 请求 3：GET /a/b/c  （演示回溯，已注册 /a/b/z 和 /a/{x}/c）
+//
+//	→ children["a"] → children["b"]      segment="b" 字面量命中
+//	    → findChild("c") = nil            "c" 无法匹配 "z"，字面量失败
+//	  → 回溯：尝试 children["a"] 的 emptyChild（单段通配符 {x}，捕获 "b"）
+//	    → children["c"]                  segment="c" 字面量命中
+//	      ✓ 命中 /a/{x}/c，matches=["b"]
+//
+// 请求 4：HEAD /users  （演示 HEAD → GET 降级）
+//
+//	root → emptyChild
+//	  → findChild("HEAD") = nil           无 HEAD 专属子树
+//	  → findChild("GET")                  HEAD 降级复用 GET 子树
+//	    → children["users"]
+//	      ✓ 命中路由②
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 节点字段与 key 的对应关系速查
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//	路由段类型                存储位置               children 中的 key
+//	─────────────────────    ───────────────────    ──────────────────
+//	字面量（如 "users"）      children["users"]      段本身的字符串值
+//	尾部斜线 {$}              children["/"]          "/"
+//	单段通配符 {name}         emptyChild             ""（空字符串）
+//	多段通配符 {name...}      multiChild             （独立字段，不在 children 中）
 
 package http
 
